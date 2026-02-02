@@ -101,10 +101,12 @@ function renderHotbar() {
 renderHotbar();
 
 // ===== DANE ŚWIATA: CHUNKI, BLOKI, MAPA ZAJĘTOŚCI =====
-const worldMeshes = [];                         // wszystkie meshe do raycastu
-const occupancy = new Map();                    // "bx,by,bz" -> { type, bx, by, bz, chunkKey, mesh }
-const chunks = new Map();                       // "cx,cz" -> {cx,cz,blocks:[]}
+const worldMeshes = [];                         // instanced meshe do raycastu
+const occupancy = new Map();                    // "bx,by,bz" -> { type, bx, by, bz, chunkKey }
+const chunks = new Map();                       // "cx,cz" -> {cx,cz,blocks:[], renderMeshes: Map}
 const blockGeometry = new THREE.BoxGeometry(blockSize, blockSize, blockSize);
+const dirtyChunks = new Set();
+const tempObject = new THREE.Object3D();
 
 function blockKey(bx, by, bz) {
   return `${bx},${by},${bz}`;
@@ -143,12 +145,8 @@ function settleSand(block) {
     const oldKey = blockKey(bx, by, bz);
     occupancy.delete(oldKey);
     block.by = targetY;
-    if (block.mesh) {
-      block.mesh.position.y = targetY * blockSize;
-    }
     occupancy.set(blockKey(bx, targetY, bz), block);
-    updateVisibilityAround(bx, by, bz);
-    updateVisibilityAround(bx, targetY, bz);
+    markChunksDirtyAround(bx, bz);
   }
 }
 
@@ -182,8 +180,7 @@ function addBlockAt(bx, by, bz, type, chunkKey = null, worldGen = false) {
     bx,
     by,
     bz,
-    chunkKey,
-    mesh: null
+    chunkKey
   };
 
   occupancy.set(key, block);
@@ -193,7 +190,7 @@ function addBlockAt(bx, by, bz, type, chunkKey = null, worldGen = false) {
   }
 
   if (!worldGen) {
-    updateVisibilityAround(bx, by, bz);
+    markChunksDirtyAround(bx, bz);
     if (type === "sand") {
       updateSandPhysicsAround(bx, by, bz);
     }
@@ -209,12 +206,6 @@ function removeBlockData(block, { skipVisibilityUpdate = false } = {}) {
   const { bx, by, bz, chunkKey } = block;
   const key = blockKey(bx, by, bz);
 
-  if (block.mesh) {
-    scene.remove(block.mesh);
-    const idx = worldMeshes.indexOf(block.mesh);
-    if (idx !== -1) worldMeshes.splice(idx, 1);
-    block.mesh = null;
-  }
   occupancy.delete(key);
 
   if (chunkKey && chunks.has(chunkKey)) {
@@ -224,14 +215,14 @@ function removeBlockData(block, { skipVisibilityUpdate = false } = {}) {
   }
 
   if (!skipVisibilityUpdate) {
-    updateVisibilityAround(bx, by, bz);
+    markChunksDirtyAround(bx, bz);
     updateSandPhysicsAround(bx, by, bz);
   }
 }
 
-function removeBlock(mesh) {
-  if (!mesh || !mesh.userData) return;
-  removeBlockData(mesh.userData);
+function removeBlock(block) {
+  if (!block) return;
+  removeBlockData(block);
 }
 
 function isBlockExposed(block) {
@@ -255,50 +246,84 @@ function isBlockExposed(block) {
   return false;
 }
 
-function createBlockMesh(block) {
-  if (!block) return;
-  const wx = block.bx * blockSize;
-  const wy = block.by * blockSize;
-  const wz = block.bz * blockSize;
-
-  const mesh = new THREE.Mesh(blockGeometry, materials[block.type]);
-  mesh.position.set(wx, wy, wz);
-  mesh.castShadow = false;
-  mesh.receiveShadow = false;
-  mesh.userData = block;
-
-  scene.add(mesh);
-  worldMeshes.push(mesh);
-  block.mesh = mesh;
+function clearChunkMeshes(chunk) {
+  if (!chunk || !chunk.renderMeshes) return;
+  for (const mesh of chunk.renderMeshes.values()) {
+    scene.remove(mesh);
+    const idx = worldMeshes.indexOf(mesh);
+    if (idx !== -1) worldMeshes.splice(idx, 1);
+  }
+  chunk.renderMeshes.clear();
 }
 
-function ensureBlockVisibility(block) {
-  if (!block) return;
-  const shouldRender = isBlockExposed(block);
-  if (shouldRender && !block.mesh) {
-    createBlockMesh(block);
-  } else if (!shouldRender && block.mesh) {
-    scene.remove(block.mesh);
-    const idx = worldMeshes.indexOf(block.mesh);
-    if (idx !== -1) worldMeshes.splice(idx, 1);
-    block.mesh = null;
+function rebuildChunkRender(chunk) {
+  if (!chunk) return;
+  if (!chunk.renderMeshes) chunk.renderMeshes = new Map();
+
+  clearChunkMeshes(chunk);
+
+  const buckets = new Map();
+  for (const block of chunk.blocks) {
+    if (!block) continue;
+    if (!isBlockExposed(block)) continue;
+    if (!buckets.has(block.type)) buckets.set(block.type, []);
+    buckets.get(block.type).push(block);
+  }
+
+  for (const [type, blocks] of buckets.entries()) {
+    const mesh = new THREE.InstancedMesh(
+      blockGeometry,
+      materials[type],
+      blocks.length
+    );
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.userData = {
+      chunkKey: chunkKeyFromCoords(chunk.cx, chunk.cz),
+      type,
+      instanceBlocks: blocks
+    };
+
+    blocks.forEach((block, index) => {
+      tempObject.position.set(
+        block.bx * blockSize,
+        block.by * blockSize,
+        block.bz * blockSize
+      );
+      tempObject.updateMatrix();
+      mesh.setMatrixAt(index, tempObject.matrix);
+    });
+
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.computeBoundingSphere();
+
+    scene.add(mesh);
+    worldMeshes.push(mesh);
+    chunk.renderMeshes.set(type, mesh);
   }
 }
 
-function updateVisibilityAround(bx, by, bz) {
-  const positions = [
-    [bx, by, bz],
-    [bx + 1, by, bz],
-    [bx - 1, by, bz],
-    [bx, by + 1, bz],
-    [bx, by - 1, bz],
-    [bx, by, bz + 1],
-    [bx, by, bz - 1]
-  ];
+function markChunksDirtyAround(bx, bz) {
+  const cx = Math.floor(bx / CHUNK_SIZE);
+  const cz = Math.floor(bz / CHUNK_SIZE);
+  const localX = ((bx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+  const localZ = ((bz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
 
-  for (const [x, y, z] of positions) {
-    const block = getBlockAt(x, y, z);
-    if (block) ensureBlockVisibility(block);
+  dirtyChunks.add(chunkKeyFromCoords(cx, cz));
+
+  if (localX === 0) dirtyChunks.add(chunkKeyFromCoords(cx - 1, cz));
+  if (localX === CHUNK_SIZE - 1) dirtyChunks.add(chunkKeyFromCoords(cx + 1, cz));
+  if (localZ === 0) dirtyChunks.add(chunkKeyFromCoords(cx, cz - 1));
+  if (localZ === CHUNK_SIZE - 1) dirtyChunks.add(chunkKeyFromCoords(cx, cz + 1));
+}
+
+function flushDirtyChunks() {
+  if (dirtyChunks.size === 0) return;
+  const toProcess = Array.from(dirtyChunks);
+  dirtyChunks.clear();
+  for (const key of toProcess) {
+    const chunk = chunks.get(key);
+    if (chunk) rebuildChunkRender(chunk);
   }
 }
 
@@ -422,25 +447,7 @@ function generateChunk(cx, cz) {
 
 function finalizeChunkVisibility(chunk) {
   if (!chunk) return;
-  for (const block of chunk.blocks) {
-    ensureBlockVisibility(block);
-  }
-
-  const startBx = chunk.cx * CHUNK_SIZE;
-  const endBx = startBx + CHUNK_SIZE - 1;
-  const startBz = chunk.cz * CHUNK_SIZE;
-  const endBz = startBz + CHUNK_SIZE - 1;
-
-  for (const block of chunk.blocks) {
-    if (
-      block.bx === startBx ||
-      block.bx === endBx ||
-      block.bz === startBz ||
-      block.bz === endBz
-    ) {
-      updateVisibilityAround(block.bx, block.by, block.bz);
-    }
-  }
+  rebuildChunkRender(chunk);
 }
 
 function updateChunksAroundPlayer() {
@@ -469,32 +476,17 @@ function updateChunksAroundPlayer() {
   for (const key of keysToRemove) {
     const chunk = chunks.get(key);
     if (!chunk) continue;
-    const startBx = chunk.cx * CHUNK_SIZE;
-    const endBx = startBx + CHUNK_SIZE - 1;
-    const startBz = chunk.cz * CHUNK_SIZE;
-    const endBz = startBz + CHUNK_SIZE - 1;
-
     for (const block of chunk.blocks) {
       if (!block) continue;
       const { bx, by, bz } = block;
       occupancy.delete(blockKey(bx, by, bz));
-      if (block.mesh) {
-        const idx = worldMeshes.indexOf(block.mesh);
-        if (idx !== -1) worldMeshes.splice(idx, 1);
-        scene.remove(block.mesh);
-        block.mesh = null;
-      }
-
-      if (
-        bx === startBx ||
-        bx === endBx ||
-        bz === startBz ||
-        bz === endBz
-      ) {
-        updateVisibilityAround(bx, by, bz);
-      }
     }
+    clearChunkMeshes(chunk);
     chunks.delete(key);
+    markChunksDirtyAround(chunk.cx * CHUNK_SIZE, chunk.cz * CHUNK_SIZE);
+    markChunksDirtyAround((chunk.cx + 1) * CHUNK_SIZE - 1, chunk.cz * CHUNK_SIZE);
+    markChunksDirtyAround(chunk.cx * CHUNK_SIZE, (chunk.cz + 1) * CHUNK_SIZE - 1);
+    markChunksDirtyAround((chunk.cx + 1) * CHUNK_SIZE - 1, (chunk.cz + 1) * CHUNK_SIZE - 1);
   }
 }
 
@@ -658,7 +650,10 @@ function pickBlockUnderCrosshair() {
   const intersects = raycaster.intersectObjects(worldMeshes);
   if (intersects.length === 0) return;
   const hit = intersects[0];
-  const type = hit.object.userData?.type;
+  const instanceId = hit.instanceId;
+  const blocks = hit.object.userData?.instanceBlocks;
+  const block = blocks && instanceId !== undefined ? blocks[instanceId] : null;
+  const type = block?.type;
   if (!type) return;
   if (!blockTypes.includes(type)) return; // bez bedrocku itp.
   currentBlockType = type;
@@ -682,22 +677,24 @@ function handleBlockClick(e) {
 
   if (intersects.length === 0) return;
   const hit = intersects[0];
+  const instanceId = hit.instanceId;
+  const blocks = hit.object.userData?.instanceBlocks;
+  const targetBlock = blocks && instanceId !== undefined ? blocks[instanceId] : null;
+  if (!targetBlock) return;
 
   if (e.button === 0) {
     // niszczenie bloku (bez bedrocku)
-    removeBlock(hit.object);
+    removeBlock(targetBlock);
   } else if (e.button === 2) {
     // stawianie bloku – nie pozwalamy klikać bedrocku
-    if (hit.object.userData?.type === "bedrock") return;
+    if (targetBlock.type === "bedrock") return;
 
-    const normal = hit.face.normal.clone();
-    const pos = hit.object.position.clone().add(
-      normal.multiplyScalar(blockSize)
-    );
+    const normal = hit.face?.normal;
+    if (!normal) return;
 
-    const bx = Math.round(pos.x / blockSize);
-    const by = Math.round(pos.y / blockSize);
-    const bz = Math.round(pos.z / blockSize);
+    const bx = targetBlock.bx + Math.round(normal.x);
+    const by = targetBlock.by + Math.round(normal.y);
+    const bz = targetBlock.bz + Math.round(normal.z);
 
     if (by <= 0) return; // nie stawiamy w miejscu bedrocku ani poniżej
 
@@ -910,6 +907,8 @@ function animate(now) {
       lastChunkUpdate = now;
     }
   }
+
+  flushDirtyChunks();
 
   // FPS
   fpsFrames++;
