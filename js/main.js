@@ -102,7 +102,7 @@ renderHotbar();
 
 // ===== DANE ŚWIATA: CHUNKI, BLOKI, MAPA ZAJĘTOŚCI =====
 const worldMeshes = [];                         // wszystkie meshe do raycastu
-const occupancy = new Map();                    // "bx,by,bz" -> Mesh
+const occupancy = new Map();                    // "bx,by,bz" -> { type, bx, by, bz, chunkKey, mesh }
 const chunks = new Map();                       // "cx,cz" -> {cx,cz,blocks:[]}
 const blockGeometry = new THREE.BoxGeometry(blockSize, blockSize, blockSize);
 
@@ -119,28 +119,20 @@ function chunkKeyFromCoords(cx, cz) {
 }
 
 // ===== PIACH – FIZYKA =====
-function settleSand(mesh) {
-  if (!mesh || !mesh.userData) return;
-  if (mesh.userData.type !== "sand") return;
+function settleSand(block) {
+  if (!block) return;
+  if (block.type !== "sand") return;
 
-  let { bx, by, bz } = mesh.userData;
+  let { bx, by, bz } = block;
   let targetY = by;
 
   while (targetY > 1) {
     const below = getBlockAt(bx, targetY - 1, bz);
     if (!below) {
       targetY--;
-    } else if (below.userData && below.userData.type === "water") {
+    } else if (below.type === "water") {
       // piasek wpada do wody – zamiana wody na piasek
-      const waterMesh = below;
-      const keyWater = blockKey(
-        waterMesh.userData.bx,
-        waterMesh.userData.by,
-        waterMesh.userData.bz
-      );
-      scene.remove(waterMesh);
-      worldMeshes.splice(worldMeshes.indexOf(waterMesh), 1);
-      occupancy.delete(keyWater);
+      removeBlockData(below, { skipVisibilityUpdate: true });
       targetY--;
     } else {
       break;
@@ -150,9 +142,13 @@ function settleSand(mesh) {
   if (targetY !== by) {
     const oldKey = blockKey(bx, by, bz);
     occupancy.delete(oldKey);
-    mesh.userData.by = targetY;
-    mesh.position.y = targetY * blockSize;
-    occupancy.set(blockKey(bx, targetY, bz), mesh);
+    block.by = targetY;
+    if (block.mesh) {
+      block.mesh.position.y = targetY * blockSize;
+    }
+    occupancy.set(blockKey(bx, targetY, bz), block);
+    updateVisibilityAround(bx, by, bz);
+    updateVisibilityAround(bx, targetY, bz);
   }
 }
 
@@ -165,9 +161,9 @@ function updateSandPhysicsAround(bx, by, bz) {
         const mx = bx + dx;
         const my = by + dy;
         const mz = bz + dz;
-        const m = getBlockAt(mx, my, mz);
-        if (m && m.userData && m.userData.type === "sand") {
-          settleSand(m);
+        const block = getBlockAt(mx, my, mz);
+        if (block && block.type === "sand") {
+          settleSand(block);
         }
       }
     }
@@ -181,50 +177,129 @@ function addBlockAt(bx, by, bz, type, chunkKey = null, worldGen = false) {
   const key = blockKey(bx, by, bz);
   if (occupancy.has(key)) return null;
 
-  const wx = bx * blockSize;
-  const wy = by * blockSize;
-  const wz = bz * blockSize;
+  const block = {
+    type,
+    bx,
+    by,
+    bz,
+    chunkKey,
+    mesh: null
+  };
 
-  const mesh = new THREE.Mesh(blockGeometry, materials[type]);
-  mesh.position.set(wx, wy, wz);
-  mesh.castShadow = false;
-  mesh.receiveShadow = false;
-  mesh.userData = { type, bx, by, bz, chunkKey };
-
-  scene.add(mesh);
-  worldMeshes.push(mesh);
-  occupancy.set(key, mesh);
+  occupancy.set(key, block);
 
   if (chunkKey && chunks.has(chunkKey)) {
-    chunks.get(chunkKey).blocks.push(mesh);
+    chunks.get(chunkKey).blocks.push(block);
   }
 
-  if (!worldGen && type === "sand") {
-    updateSandPhysicsAround(bx, by, bz);
+  if (!worldGen) {
+    updateVisibilityAround(bx, by, bz);
+    if (type === "sand") {
+      updateSandPhysicsAround(bx, by, bz);
+    }
   }
 
-  return mesh;
+  return block;
 }
 
-function removeBlock(mesh) {
-  if (!mesh || !mesh.userData) return;
-  if (mesh.userData.type === "bedrock") return; // bedrock niezniszczalny
+function removeBlockData(block, { skipVisibilityUpdate = false } = {}) {
+  if (!block) return;
+  if (block.type === "bedrock") return; // bedrock niezniszczalny
 
-  const { bx, by, bz, chunkKey } = mesh.userData;
+  const { bx, by, bz, chunkKey } = block;
   const key = blockKey(bx, by, bz);
 
-  scene.remove(mesh);
-  const idx = worldMeshes.indexOf(mesh);
-  if (idx !== -1) worldMeshes.splice(idx, 1);
+  if (block.mesh) {
+    scene.remove(block.mesh);
+    const idx = worldMeshes.indexOf(block.mesh);
+    if (idx !== -1) worldMeshes.splice(idx, 1);
+    block.mesh = null;
+  }
   occupancy.delete(key);
 
   if (chunkKey && chunks.has(chunkKey)) {
     const arr = chunks.get(chunkKey).blocks;
-    const i2 = arr.indexOf(mesh);
+    const i2 = arr.indexOf(block);
     if (i2 !== -1) arr.splice(i2, 1);
   }
 
-  updateSandPhysicsAround(bx, by, bz);
+  if (!skipVisibilityUpdate) {
+    updateVisibilityAround(bx, by, bz);
+    updateSandPhysicsAround(bx, by, bz);
+  }
+}
+
+function removeBlock(mesh) {
+  if (!mesh || !mesh.userData) return;
+  removeBlockData(mesh.userData);
+}
+
+function isBlockExposed(block) {
+  if (!block) return false;
+  const { bx, by, bz, type } = block;
+  const neighbors = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1]
+  ];
+
+  for (const [dx, dy, dz] of neighbors) {
+    const neighbor = getBlockAt(bx + dx, by + dy, bz + dz);
+    if (!neighbor) return true;
+    if (neighbor.type === "water" && type !== "water") return true;
+    if (type === "water" && neighbor.type !== "water") return true;
+  }
+  return false;
+}
+
+function createBlockMesh(block) {
+  if (!block) return;
+  const wx = block.bx * blockSize;
+  const wy = block.by * blockSize;
+  const wz = block.bz * blockSize;
+
+  const mesh = new THREE.Mesh(blockGeometry, materials[block.type]);
+  mesh.position.set(wx, wy, wz);
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  mesh.userData = block;
+
+  scene.add(mesh);
+  worldMeshes.push(mesh);
+  block.mesh = mesh;
+}
+
+function ensureBlockVisibility(block) {
+  if (!block) return;
+  const shouldRender = isBlockExposed(block);
+  if (shouldRender && !block.mesh) {
+    createBlockMesh(block);
+  } else if (!shouldRender && block.mesh) {
+    scene.remove(block.mesh);
+    const idx = worldMeshes.indexOf(block.mesh);
+    if (idx !== -1) worldMeshes.splice(idx, 1);
+    block.mesh = null;
+  }
+}
+
+function updateVisibilityAround(bx, by, bz) {
+  const positions = [
+    [bx, by, bz],
+    [bx + 1, by, bz],
+    [bx - 1, by, bz],
+    [bx, by + 1, bz],
+    [bx, by - 1, bz],
+    [bx, by, bz + 1],
+    [bx, by, bz - 1]
+  ];
+
+  for (const [x, y, z] of positions) {
+    const block = getBlockAt(x, y, z);
+    if (block) ensureBlockVisibility(block);
+  }
 }
 
 // ===== GENERATOR TERENU =====
@@ -264,8 +339,8 @@ function generateChunk(cx, cz) {
       const surface = terrainHeight(bx, bz);
 
       // bedrock na dnie
-      const bedrockMesh = addBlockAt(bx, 0, bz, "bedrock", key, true);
-      if (bedrockMesh) blocks.push(bedrockMesh);
+      const bedrockBlock = addBlockAt(bx, 0, bz, "bedrock", key, true);
+      if (bedrockBlock) blocks.push(bedrockBlock);
 
       if (surface <= WATER_LEVEL) {
         // dno zbiornika
@@ -273,13 +348,13 @@ function generateChunk(cx, cz) {
         for (let y = bottomStart; y <= surface; y++) {
           let type = "stone";
           if (y >= surface - 1) type = "sand"; // plaża dna
-          const m = addBlockAt(bx, y, bz, type, key, true);
-          if (m) blocks.push(m);
+          const block = addBlockAt(bx, y, bz, type, key, true);
+          if (block) blocks.push(block);
         }
         // woda od powierzchni do WATER_LEVEL
         for (let y = surface + 1; y <= WATER_LEVEL; y++) {
-          const m = addBlockAt(bx, y, bz, "water", key, true);
-          if (m) blocks.push(m);
+          const block = addBlockAt(bx, y, bz, "water", key, true);
+          if (block) blocks.push(block);
         }
       } else {
         // ląd nad poziomem wody
@@ -289,22 +364,22 @@ function generateChunk(cx, cz) {
         for (let y = startSolid; y < grassHeight; y++) {
           let type = "stone";
           if (y >= grassHeight - 2) type = "dirt";
-          const m = addBlockAt(bx, y, bz, type, key, true);
-          if (m) blocks.push(m);
+          const block = addBlockAt(bx, y, bz, type, key, true);
+          if (block) blocks.push(block);
         }
 
         // blok powierzchni – trawa, piasek przy brzegach świata
         let topType = "grass";
         const distEdge = Math.max(Math.abs(bx), Math.abs(bz));
         if (distEdge > HALF_WORLD * 0.7) topType = "sand";
-        const topMesh = addBlockAt(bx, grassHeight, bz, topType, key, true);
-        if (topMesh) blocks.push(topMesh);
+        const topBlock = addBlockAt(bx, grassHeight, bz, topType, key, true);
+        if (topBlock) blocks.push(topBlock);
 
         // drzewa tylko na lądzie
         if (topType === "grass" && Math.random() > 0.985) {
           const treeHeight = 4 + Math.floor(Math.random() * 2);
           for (let y = 1; y <= treeHeight; y++) {
-            const m = addBlockAt(
+            const block = addBlockAt(
               bx,
               grassHeight + y,
               bz,
@@ -312,7 +387,7 @@ function generateChunk(cx, cz) {
               key,
               true
             );
-            if (m) blocks.push(m);
+            if (block) blocks.push(block);
           }
 
           const topY = grassHeight + treeHeight + 1;
@@ -322,7 +397,7 @@ function generateChunk(cx, cz) {
                 const dd =
                   Math.abs(lx) + Math.abs(lz) + Math.abs(ly);
                 if (dd <= 3) {
-                  const m = addBlockAt(
+                  const block = addBlockAt(
                     bx + lx,
                     topY + ly,
                     bz + lz,
@@ -330,7 +405,7 @@ function generateChunk(cx, cz) {
                     key,
                     true
                   );
-                  if (m) blocks.push(m);
+                  if (block) blocks.push(block);
                 }
               }
             }
@@ -340,7 +415,32 @@ function generateChunk(cx, cz) {
     }
   }
 
-  chunks.set(key, { cx, cz, blocks });
+  const chunk = { cx, cz, blocks };
+  chunks.set(key, chunk);
+  finalizeChunkVisibility(chunk);
+}
+
+function finalizeChunkVisibility(chunk) {
+  if (!chunk) return;
+  for (const block of chunk.blocks) {
+    ensureBlockVisibility(block);
+  }
+
+  const startBx = chunk.cx * CHUNK_SIZE;
+  const endBx = startBx + CHUNK_SIZE - 1;
+  const startBz = chunk.cz * CHUNK_SIZE;
+  const endBz = startBz + CHUNK_SIZE - 1;
+
+  for (const block of chunk.blocks) {
+    if (
+      block.bx === startBx ||
+      block.bx === endBx ||
+      block.bz === startBz ||
+      block.bz === endBz
+    ) {
+      updateVisibilityAround(block.bx, block.by, block.bz);
+    }
+  }
 }
 
 function updateChunksAroundPlayer() {
@@ -369,13 +469,30 @@ function updateChunksAroundPlayer() {
   for (const key of keysToRemove) {
     const chunk = chunks.get(key);
     if (!chunk) continue;
-    for (const mesh of chunk.blocks) {
-      if (!mesh || !mesh.userData) continue;
-      const { bx, by, bz } = mesh.userData;
+    const startBx = chunk.cx * CHUNK_SIZE;
+    const endBx = startBx + CHUNK_SIZE - 1;
+    const startBz = chunk.cz * CHUNK_SIZE;
+    const endBz = startBz + CHUNK_SIZE - 1;
+
+    for (const block of chunk.blocks) {
+      if (!block) continue;
+      const { bx, by, bz } = block;
       occupancy.delete(blockKey(bx, by, bz));
-      const idx = worldMeshes.indexOf(mesh);
-      if (idx !== -1) worldMeshes.splice(idx, 1);
-      scene.remove(mesh);
+      if (block.mesh) {
+        const idx = worldMeshes.indexOf(block.mesh);
+        if (idx !== -1) worldMeshes.splice(idx, 1);
+        scene.remove(block.mesh);
+        block.mesh = null;
+      }
+
+      if (
+        bx === startBx ||
+        bx === endBx ||
+        bz === startBz ||
+        bz === endBz
+      ) {
+        updateVisibilityAround(bx, by, bz);
+      }
     }
     chunks.delete(key);
   }
@@ -726,7 +843,7 @@ function isInWater() {
     (camera.position.y - PLAYER_HALF_HEIGHT) / blockSize
   );
   const block = getBlockAt(bx, footY, bz);
-  return block && block.userData.type === "water";
+  return block && block.type === "water";
 }
 
 // ===== MAIN LOOP =====
