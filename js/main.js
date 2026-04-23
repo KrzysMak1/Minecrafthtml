@@ -14,10 +14,11 @@ const blockSize = 2;             // rozmiar bloku w jednostkach 3D
 const canvas = document.getElementById("game");
 const renderer = new THREE.WebGLRenderer({
   canvas,
-  antialias: false
+  antialias: false,
+  powerPreference: "high-performance"
 });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
 renderer.shadowMap.enabled = false;
 
 const scene = new THREE.Scene();
@@ -104,9 +105,28 @@ renderHotbar();
 const worldMeshes = [];                         // instanced meshe do raycastu
 const occupancy = new Map();                    // "bx,by,bz" -> { type, bx, by, bz, chunkKey }
 const chunks = new Map();                       // "cx,cz" -> {cx,cz,blocks:[], renderMeshes: Map}
-const blockGeometry = new THREE.BoxGeometry(blockSize, blockSize, blockSize);
 const dirtyChunks = new Set();
 const tempObject = new THREE.Object3D();
+const MAX_DIRTY_CHUNKS_PER_FRAME = 2;
+const halfBlock = blockSize / 2;
+
+const FACE_DEFS = [
+  { key: "px", normal: [1, 0, 0], materialIndex: 0, rx: 0, ry: -Math.PI / 2, rz: 0, tx: halfBlock, ty: 0, tz: 0 },
+  { key: "nx", normal: [-1, 0, 0], materialIndex: 1, rx: 0, ry: Math.PI / 2, rz: 0, tx: -halfBlock, ty: 0, tz: 0 },
+  { key: "py", normal: [0, 1, 0], materialIndex: 2, rx: -Math.PI / 2, ry: 0, rz: 0, tx: 0, ty: halfBlock, tz: 0 },
+  { key: "ny", normal: [0, -1, 0], materialIndex: 3, rx: Math.PI / 2, ry: 0, rz: 0, tx: 0, ty: -halfBlock, tz: 0 },
+  { key: "pz", normal: [0, 0, 1], materialIndex: 4, rx: 0, ry: 0, rz: 0, tx: 0, ty: 0, tz: halfBlock },
+  { key: "nz", normal: [0, 0, -1], materialIndex: 5, rx: 0, ry: Math.PI, rz: 0, tx: 0, ty: 0, tz: -halfBlock }
+];
+
+for (const face of FACE_DEFS) {
+  const geometry = new THREE.PlaneGeometry(blockSize, blockSize);
+  geometry.rotateX(face.rx);
+  geometry.rotateY(face.ry);
+  geometry.rotateZ(face.rz);
+  geometry.translate(face.tx, face.ty, face.tz);
+  face.geometry = geometry;
+}
 
 function blockKey(bx, by, bz) {
   return `${bx},${by},${bz}`;
@@ -246,6 +266,14 @@ function isBlockExposed(block) {
   return false;
 }
 
+function shouldRenderFace(block, nx, ny, nz) {
+  const neighbor = getBlockAt(block.bx + nx, block.by + ny, block.bz + nz);
+  if (!neighbor) return true;
+  if (neighbor.type === "water" && block.type !== "water") return true;
+  if (block.type === "water" && neighbor.type !== "water") return true;
+  return false;
+}
+
 function clearChunkMeshes(chunk) {
   if (!chunk || !chunk.renderMeshes) return;
   for (const mesh of chunk.renderMeshes.values()) {
@@ -266,14 +294,23 @@ function rebuildChunkRender(chunk) {
   for (const block of chunk.blocks) {
     if (!block) continue;
     if (!isBlockExposed(block)) continue;
-    if (!buckets.has(block.type)) buckets.set(block.type, []);
-    buckets.get(block.type).push(block);
+
+    for (const faceDef of FACE_DEFS) {
+      const [nx, ny, nz] = faceDef.normal;
+      if (!shouldRenderFace(block, nx, ny, nz)) continue;
+      const bucketKey = `${block.type}:${faceDef.key}`;
+      if (!buckets.has(bucketKey)) {
+        buckets.set(bucketKey, { type: block.type, faceDef, blocks: [] });
+      }
+      buckets.get(bucketKey).blocks.push(block);
+    }
   }
 
-  for (const [type, blocks] of buckets.entries()) {
+  for (const bucket of buckets.values()) {
+    const { type, faceDef, blocks } = bucket;
     const mesh = new THREE.InstancedMesh(
-      blockGeometry,
-      materials[type],
+      faceDef.geometry,
+      materials[type][faceDef.materialIndex],
       blocks.length
     );
     mesh.castShadow = false;
@@ -281,6 +318,7 @@ function rebuildChunkRender(chunk) {
     mesh.userData = {
       chunkKey: chunkKeyFromCoords(chunk.cx, chunk.cz),
       type,
+      face: faceDef.key,
       instanceBlocks: blocks
     };
 
@@ -299,7 +337,7 @@ function rebuildChunkRender(chunk) {
 
     scene.add(mesh);
     worldMeshes.push(mesh);
-    chunk.renderMeshes.set(type, mesh);
+    chunk.renderMeshes.set(`${type}:${faceDef.key}`, mesh);
   }
 }
 
@@ -319,11 +357,17 @@ function markChunksDirtyAround(bx, bz) {
 
 function flushDirtyChunks() {
   if (dirtyChunks.size === 0) return;
-  const toProcess = Array.from(dirtyChunks);
-  dirtyChunks.clear();
-  for (const key of toProcess) {
+  const iterator = dirtyChunks.values();
+  let processed = 0;
+
+  while (processed < MAX_DIRTY_CHUNKS_PER_FRAME) {
+    const next = iterator.next();
+    if (next.done) break;
+    const key = next.value;
+    dirtyChunks.delete(key);
     const chunk = chunks.get(key);
     if (chunk) rebuildChunkRender(chunk);
+    processed++;
   }
 }
 
@@ -642,12 +686,15 @@ document.addEventListener("pointerlockchange", () => {
 // ===== RAYCAST + PICK BLOCK =====
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
+const raycastHits = [];
+raycaster.far = (VIEW_DISTANCE + 1) * CHUNK_SIZE * blockSize;
 
 function pickBlockUnderCrosshair() {
   mouse.x = 0;
   mouse.y = 0;
   raycaster.setFromCamera(mouse, camera);
-  const intersects = raycaster.intersectObjects(worldMeshes);
+  raycastHits.length = 0;
+  const intersects = raycaster.intersectObjects(worldMeshes, false, raycastHits);
   if (intersects.length === 0) return;
   const hit = intersects[0];
   const instanceId = hit.instanceId;
@@ -673,7 +720,8 @@ function handleBlockClick(e) {
   }
 
   raycaster.setFromCamera(mouse, camera);
-  const intersects = raycaster.intersectObjects(worldMeshes);
+  raycastHits.length = 0;
+  const intersects = raycaster.intersectObjects(worldMeshes, false, raycastHits);
 
   if (intersects.length === 0) return;
   const hit = intersects[0];
@@ -845,6 +893,9 @@ function isInWater() {
 
 // ===== MAIN LOOP =====
 let lastTime = performance.now();
+const forwardVec = new THREE.Vector3();
+const rightVec = new THREE.Vector3();
+let lastCoordsUpdate = 0;
 
 function animate(now) {
   requestAnimationFrame(animate);
@@ -855,33 +906,25 @@ function animate(now) {
     const baseSpeed = 14 * blockSize / 2;
     const speed = baseSpeed * (isInWater() ? 0.4 : 1) * delta;
 
-    const forward = new THREE.Vector3(
-      Math.sin(rotY),
-      0,
-      Math.cos(rotY)
-    ).normalize();
-    const right = new THREE.Vector3(
-      Math.cos(rotY),
-      0,
-      -Math.sin(rotY)
-    ).normalize();
+    forwardVec.set(Math.sin(rotY), 0, Math.cos(rotY)).normalize();
+    rightVec.set(Math.cos(rotY), 0, -Math.sin(rotY)).normalize();
 
     let moveX = 0, moveY = 0, moveZ = 0;
     if (moveForward) {
-      moveX += -forward.x * speed;
-      moveZ += -forward.z * speed;
+      moveX += -forwardVec.x * speed;
+      moveZ += -forwardVec.z * speed;
     }
     if (moveBackward) {
-      moveX += forward.x * speed;
-      moveZ += forward.z * speed;
+      moveX += forwardVec.x * speed;
+      moveZ += forwardVec.z * speed;
     }
     if (moveLeft) {
-      moveX += -right.x * speed;
-      moveZ += -right.z * speed;
+      moveX += -rightVec.x * speed;
+      moveZ += -rightVec.z * speed;
     }
     if (moveRight) {
-      moveX += right.x * speed;
-      moveZ += right.z * speed;
+      moveX += rightVec.x * speed;
+      moveZ += rightVec.z * speed;
     }
     if (moveUp) moveY += speed;
     if (moveDown) moveY -= speed;
@@ -922,7 +965,10 @@ function animate(now) {
     lastFpsUpdate = nowMs;
   }
 
-  updateCoords();
+  if (now - lastCoordsUpdate > 100) {
+    updateCoords();
+    lastCoordsUpdate = now;
+  }
   renderer.render(scene, camera);
 }
 
